@@ -18,10 +18,32 @@ type SWbemServices struct {
 	cWMIClient            *Client //This could also be an embedded struct, but then we would need to branch on Client vs SWbemServices in the Query method
 	sWbemLocatorIUnknown  *ole.IUnknown
 	sWbemLocatorIDispatch *ole.IDispatch
+	WbemQueryFlags        uint32
 	queries               chan *queryRequest
 	closeError            chan error
 	lQueryorClose         sync.Mutex
 }
+
+const (
+	// Causes WMI to retain pointers to objects of the enumeration until the client releases the enumerator.
+	WbemFlagBidirectional uint32 = 0x0
+	// Causes this call to block until the query is complete. This flag calls the method in the synchronous mode.
+	WbemFlagReturnWhenComplete = 0x0
+
+	// Used for prototyping. This flag stops the query from happening and returns an object that looks like a typical
+	// result object.
+	wbemQueryFlagPrototype = 0x2
+
+	// Causes the call to return immediately. This is the default.
+	WbemFlagReturnImmediately = 0x10
+
+	// Causes a forward-only enumerator to be returned. Forward-only enumerators are generally much faster and use less
+	// memory than conventional enumerators, but they do not allow calls to SWbemObject.Clone_.
+	WbemFlagForwardOnly = 0x20
+
+	// Causes WMI to return class amendment data with the base class definition.
+	WbemFlagUseAmendedQualifiers = 0x20000
+)
 
 type queryRequest struct {
 	query    string
@@ -36,6 +58,7 @@ func InitializeSWbemServices(c *Client, connectServerArgs ...interface{}) (*SWbe
 	//TODO: implement connectServerArgs as optional argument for init with connectServer call
 	s := new(SWbemServices)
 	s.cWMIClient = c
+	s.WbemQueryFlags = WbemFlagReturnImmediately
 	s.queries = make(chan *queryRequest)
 	initError := make(chan error)
 	go s.process(initError)
@@ -193,16 +216,21 @@ func (s *SWbemServices) queryBackground(q *queryRequest) error {
 	defer serviceRaw.Clear()
 
 	// result is a SWBemObjectSet
-	resultRaw, err := oleutil.CallMethod(service, "ExecQuery", q.query)
+	resultRaw, err := oleutil.CallMethod(service, "ExecQuery", q.query, "WQL", s.WbemQueryFlags)
 	if err != nil {
 		return err
 	}
 	result := resultRaw.ToIDispatch()
 	defer resultRaw.Clear()
 
-	count, err := oleInt64(result, "Count")
-	if err != nil {
-		return err
+	var count int64
+	// If the WbemFlagForwardOnly is _not_ set, we can know the number of returned elements, which allows us some
+	// optimizations below
+	if s.WbemQueryFlags&WbemFlagForwardOnly != WbemFlagForwardOnly {
+		count, err = oleInt64(result, "Count")
+		if err != nil {
+			return err
+		}
 	}
 
 	enumProperty, err := result.GetProperty("_NewEnum")
